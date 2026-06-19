@@ -66,6 +66,25 @@ _SUBDOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$")
 
 
 def sanitize_subdomain(raw: str) -> str:
+    """Normalize *and validate* a Zendesk subdomain, exiting on bad input.
+
+    Strips scheme/path and a trailing ``.zendesk.com`` (like
+    :func:`client._normalize_subdomain`), then enforces the DNS-label rule via
+    ``_SUBDOMAIN_RE`` (1-63 alphanumerics/hyphens). Unlike the client-side
+    helper, an invalid slug here prints an error and calls ``sys.exit(1)`` —
+    this is an interactive setup tool, so failing fast is intended.
+
+    Reference:
+        Called once by :func:`main` on the user-entered subdomain before any URL
+        is built. The validated slug then flows into :func:`build_auth_url`,
+        :func:`exchange_code`, :func:`verify_token`, and :func:`save_credentials`.
+
+    Args:
+        raw: Raw subdomain, hostname, or URL typed by the user.
+
+    Returns:
+        The validated, lowercased subdomain slug.
+    """
     cleaned = raw.strip().lower()
     if "://" in cleaned:
         parsed = urllib.parse.urlparse(cleaned)
@@ -85,6 +104,26 @@ def sanitize_subdomain(raw: str) -> str:
 
 
 def build_auth_url(subdomain: str, client_id: str, scope: str, state: str) -> str:
+    """Build the Zendesk ``/oauth/authorizations/new`` URL for the browser step.
+
+    Fills the ``AUTH_URL`` template, URL-encoding every interpolated value so
+    scopes (which contain spaces) and the CSRF ``state`` survive transport.
+
+    Reference:
+        Called by :func:`main` with a ``state`` produced by
+        ``secrets.token_urlsafe``; that same ``state`` is later re-checked by
+        :func:`parse_redirect_url`. Verified by
+        ``test_client.TestFirstRunHelpers.test_build_auth_url_includes_state``.
+
+    Args:
+        subdomain: Validated subdomain slug.
+        client_id: OAuth client identifier.
+        scope: Space-separated scope string (see ``SCOPES``).
+        state: Random anti-CSRF token echoed back in the redirect.
+
+    Returns:
+        The fully-qualified authorization URL to open in the browser.
+    """
     return AUTH_URL.format(
         subdomain=urllib.parse.quote(subdomain, safe=""),
         redirect_uri=urllib.parse.quote(REDIRECT_URI, safe=""),
@@ -97,6 +136,33 @@ def build_auth_url(subdomain: str, client_id: str, scope: str, state: str) -> st
 def exchange_code(
     subdomain: str, client_id: str, secret: str, code: str, scope: str
 ) -> Tuple[str, Optional[str], str]:
+    """Exchange an authorization ``code`` for access + refresh tokens.
+
+    Performs the OAuth ``authorization_code`` grant against
+    ``/oauth/tokens``. Any network error, non-2xx status, non-JSON body, or
+    missing ``access_token`` prints a diagnostic and exits — there is no
+    sensible way to continue setup without a token.
+
+    Reference:
+        Called by :func:`main` with the ``code`` returned from
+        :func:`parse_redirect_url`. The returned access token is then handed to
+        :func:`verify_token` and :func:`save_credentials`, and ``granted`` is
+        compared against the requested scope by :func:`compare_scopes`. The
+        sibling :meth:`client.ZendeskTokenManager._do_refresh` later performs the
+        analogous ``refresh_token`` grant against the same endpoint. Error path
+        covered by
+        ``test_client.TestFirstRunHelpers.test_exchange_code_handles_request_exception``.
+
+    Args:
+        subdomain: Validated subdomain slug.
+        client_id: OAuth client identifier.
+        secret: OAuth client secret.
+        code: One-time authorization code from the redirect URL.
+        scope: Space-separated scope string requested.
+
+    Returns:
+        ``(access_token, refresh_token_or_None, granted_scope_string)``.
+    """
     url = TOKEN_ENDPOINT.format(subdomain=subdomain)
     try:
         resp = requests.post(
@@ -136,6 +202,26 @@ def exchange_code(
 
 
 def verify_token(subdomain: str, token: str) -> dict:
+    """Confirm a freshly-issued token works by calling ``users/me.json``.
+
+    Makes one authenticated ``GET`` against the live Zendesk API. A ``401``
+    means the token was issued but rejected (often a permissions problem on the
+    approving user); any network/non-2xx/non-JSON outcome also prints a
+    diagnostic and exits. On success it distils the identity into a small dict.
+
+    Reference:
+        Called by :func:`main` immediately after :func:`exchange_code`; the
+        returned dict is displayed to the user and embedded by
+        :func:`save_credentials` under the ``user`` key. Error path covered by
+        ``test_client.TestFirstRunHelpers.test_verify_token_handles_request_exception``.
+
+    Args:
+        subdomain: Validated subdomain slug.
+        token: The access token to test.
+
+    Returns:
+        ``{"name", "email", "role", "account_name"}`` for the authenticated user.
+    """
     try:
         resp = requests.get(
             f"https://{subdomain}.zendesk.com/api/v2/users/me.json",
@@ -178,6 +264,25 @@ def save_credentials(
     oauth_client_secret: str,
     user_info: dict,
 ) -> None:
+    """Write all credentials to ``credentials.json`` with 0600 permissions.
+
+    Serializes the tokens, client credentials, an ``acquired_at`` wall-clock
+    timestamp, and the verified ``user_info`` to ``CREDS_FILE``, then restricts
+    the file to owner-read/write only — it contains live secrets.
+
+    Reference:
+        Called by :func:`main` as the final persistence step. The file shape it
+        produces is exactly what :func:`client.load_credentials` reads back
+        (including ``acquired_at``, which seeds :attr:`client.ZendeskTokenManager.age`).
+
+    Args:
+        subdomain: Validated subdomain slug.
+        oauth_token: Access token from :func:`exchange_code`.
+        oauth_refresh_token: Refresh token, or ``None`` if not granted.
+        oauth_client_id: OAuth client identifier.
+        oauth_client_secret: OAuth client secret.
+        user_info: Identity dict from :func:`verify_token`.
+    """
     payload = {
         "subdomain": subdomain,
         "oauth_token": oauth_token,
@@ -195,6 +300,27 @@ def save_credentials(
 
 
 def parse_redirect_url(url: str, expected_state: str) -> str:
+    """Extract the authorization ``code`` from the pasted redirect URL.
+
+    Parses the query string and enforces the OAuth safety checks in order:
+    surface any ``error`` Zendesk returned, require a ``state`` that matches
+    ``expected_state`` (anti-CSRF / stale-paste guard), then require a ``code``.
+    Every failure prints guidance and exits.
+
+    Reference:
+        Called by :func:`main` on the URL the user copies out of the browser
+        after clicking *Allow*; ``expected_state`` is the value previously fed to
+        :func:`build_auth_url`. The returned code goes straight into
+        :func:`exchange_code`. Verified by
+        ``test_client.TestFirstRunHelpers.test_parse_redirect_url_validates_state``.
+
+    Args:
+        url: The full redirect URL pasted by the user.
+        expected_state: The ``state`` generated for this session.
+
+    Returns:
+        The one-time authorization code.
+    """
     parsed = urllib.parse.urlparse(url.strip())
     if not parsed.query:
         print(
@@ -232,6 +358,21 @@ def parse_redirect_url(url: str, expected_state: str) -> str:
 
 
 def compare_scopes(asked: str, granted: str) -> None:
+    """Warn (non-fatally) if Zendesk granted fewer scopes than requested.
+
+    Diffs the requested scope set against what was granted; ``offline_access``
+    is ignored since it governs refresh-token issuance rather than API access.
+    Any remaining gap is printed as a heads-up that some calls may later 403.
+    This never exits — a partial grant can still be usable.
+
+    Reference:
+        Called by :func:`main` using the ``granted`` scope string returned by
+        :func:`exchange_code`.
+
+    Args:
+        asked: Space-separated scopes that were requested.
+        granted: Space-separated scopes Zendesk actually granted.
+    """
     if not granted:
         return
     asked_set = set(asked.split())
@@ -255,6 +396,20 @@ def compare_scopes(asked: str, granted: str) -> None:
 
 
 def main() -> None:
+    """Run the full interactive OAuth authorization-code setup, end to end.
+
+    Orchestrates the eight-step flow described in the module docstring:
+    gather inputs -> :func:`sanitize_subdomain`; build & open the URL ->
+    :func:`build_auth_url`; read the redirect -> :func:`parse_redirect_url`;
+    swap the code -> :func:`exchange_code` (+ :func:`compare_scopes`); prove the
+    token works -> :func:`verify_token`; persist -> :func:`save_credentials`;
+    then smoke-test auto-refresh via :class:`client.ZendeskTokenManager`.
+
+    Reference:
+        The script entry point — invoked from the ``__main__`` guard when the
+        file is run as ``python first_run.py``. Produces the ``credentials.json``
+        that :func:`client.load_credentials` and ``watch_token.py`` consume.
+    """
     print("=" * 60)
     print("  Zendesk OAuth First-Time Setup")
     print("=" * 60)

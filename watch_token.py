@@ -18,6 +18,22 @@ from client import load_credentials
 
 
 def main():
+    """Poll the token manager forever, printing token + age every 2 seconds.
+
+    Loads credentials, prints the TTL/refresh threshold once, then loops:
+    each tick calls :meth:`client.ZendeskTokenManager.get_token` (which triggers
+    a proactive refresh once ~80% of the TTL has elapsed) and reads
+    :attr:`client.ZendeskTokenManager.age`. When the returned token differs from
+    the previous one, the row is flagged ``← REFRESHED`` so you can watch
+    auto-refresh happen live.
+
+    Reference:
+        The script entry point, run under the ``__main__`` guard which traps
+        ``KeyboardInterrupt`` for a clean exit. Reads ``credentials.json`` via
+        :func:`client.load_credentials`, so :mod:`first_run` must have run first.
+        Touches the private ``_ttl`` / ``REFRESH_THRESHOLD`` attributes purely to
+        display the refresh point — production callers should not rely on those.
+    """
     mgr = load_credentials("credentials.json")
 
     print(f"  has_refresh: {mgr.has_refresh}")

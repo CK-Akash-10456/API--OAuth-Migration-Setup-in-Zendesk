@@ -68,7 +68,28 @@ log = logging.getLogger(__name__)
 
 
 def _normalize_subdomain(raw: str) -> str:
-    """Accept a bare subdomain or a full Zendesk hostname/URL."""
+    """Reduce any Zendesk identifier to its bare subdomain slug.
+
+    Accepts a bare subdomain, a full hostname, or a complete URL and strips
+    scheme, path, port, query, fragment, and the trailing ``.zendesk.com`` so
+    the result can be slotted into ``https://{subdomain}.zendesk.com/...`` URLs.
+
+    Reference:
+        Called once by :meth:`ZendeskTokenManager.__init__` to populate
+        ``self.subdomain``. The mirror function used by the setup script is
+        :func:`first_run.sanitize_subdomain`, which additionally validates the
+        slug and exits on bad input.
+
+    Usage:
+        >>> _normalize_subdomain("https://ACME.zendesk.com/admin/people")
+        'acme'
+
+    Args:
+        raw: Subdomain slug, hostname, or URL (any casing, surrounding spaces).
+
+    Returns:
+        The lowercased subdomain slug with all decoration removed.
+    """
     cleaned = raw.strip().lower()
     if "://" in cleaned:
         parsed = urllib.parse.urlparse(cleaned)
@@ -149,6 +170,13 @@ class ZendeskTokenManager:
             oauth_client_secret: OAuth client secret (needed for refresh).
             ttl: Expected access token lifetime in seconds. Default 3600.
             acquired_at: Absolute Unix timestamp when the token was obtained.
+
+        Reference:
+            Runs ``subdomain`` through :func:`_normalize_subdomain`. Most callers
+            do not invoke this directly — they use :func:`load_credentials`,
+            which reads ``credentials.json`` and forwards every field here. The
+            ``acquired_at`` timestamp is translated from wall-clock time onto the
+            monotonic clock that :attr:`age` uses.
         """
         self.subdomain = _normalize_subdomain(subdomain)
         self._token: Optional[str] = oauth_token
@@ -188,6 +216,16 @@ class ZendeskTokenManager:
         if no refresh is needed or possible.
 
         Raises TokenNotSetError if no token has ever been provided.
+
+        Reference:
+            Primary entry point for callers. Delegates the age test to
+            :meth:`_age_pct` and the actual refresh to :meth:`_refresh_if_needed`.
+            Used by ``first_run.main`` (sanity check) and ``watch_token.main``
+            (polled in a loop), and is the call you wrap as
+            ``Authorization: Bearer {mgr.get_token()}`` on every API request.
+
+        Usage:
+            >>> headers = {"Authorization": f"Bearer {mgr.get_token()}"}
         """
         if self._token is None:
             raise TokenNotSetError(
@@ -208,6 +246,17 @@ class ZendeskTokenManager:
         Returns the current token without raising if no refresh token is
         available (degradation).
         Raises TokenRefreshError if the refresh attempt fails permanently.
+
+        Reference:
+            The reactive counterpart to :meth:`get_token`'s proactive refresh.
+            Acquires the lock, runs :meth:`_do_refresh`, then fires
+            :meth:`_notify_all` outside the lock. Call this when the Zendesk API
+            returns ``401 Unauthorized``, then retry the request.
+
+        Usage:
+            >>> if resp.status_code == 401:
+            ...     mgr.force_refresh()
+            ...     headers["Authorization"] = f"Bearer {mgr.get_token()}"
         """
         if self._refresh_token is None:
             log.warning("force_refresh() called but no refresh token configured.")
@@ -234,6 +283,15 @@ class ZendeskTokenManager:
 
         This does NOT call Zendesk — it only replaces in-memory values.
         Use this after the initial OAuth authorization-code flow.
+
+        Reference:
+            Resets ``self._acquired_at`` so the TTL clock restarts, mirroring
+            what :meth:`_apply_refresh_response` does after a network refresh.
+            Commonly called from inside an :meth:`on_refresh` callback to push a
+            rotated token back into the manager (see the thread-safety tests).
+
+        Usage:
+            >>> mgr.set_token(new_access_token, new_refresh_token)
         """
         if not oauth_token or not isinstance(oauth_token, str):
             raise ValueError("oauth_token must be a non-empty string.")
@@ -253,17 +311,44 @@ class ZendeskTokenManager:
 
         Multiple callbacks are supported. A failing callback does not
         prevent others from being notified.
+
+        Reference:
+            Registered callbacks are invoked by :meth:`_notify_all` after every
+            successful refresh (whether triggered by :meth:`get_token` or
+            :meth:`force_refresh`). This is the hook for persistence — Zendesk
+            persistence is *your* responsibility; use it to write the new tokens
+            to a file, database, or secrets manager.
+
+        Usage:
+            >>> def on_refresh(token, refresh_token):
+            ...     save({"token": token, "refresh": refresh_token})
+            >>> mgr.on_refresh(on_refresh)
         """
         self._callbacks.append(callback)
 
     @property
     def has_refresh(self) -> bool:
-        """True if a refresh token is available (auto-refresh possible)."""
+        """True if a refresh token is available (auto-refresh possible).
+
+        Reference:
+            Read by ``first_run.main`` and ``watch_token.main`` to report whether
+            unattended auto-refresh is wired up. When ``False``, :meth:`get_token`
+            never refreshes and :meth:`force_refresh` degrades to the current token.
+        """
         return self._refresh_token is not None
 
     @property
     def age(self) -> float:
-        """Seconds since the current token was obtained."""
+        """Seconds since the current token was obtained.
+
+        Measured against a monotonic clock (immune to wall-clock adjustments).
+        ``self._acquired_at`` is set in :meth:`__init__`, :meth:`set_token`, and
+        :meth:`_apply_refresh_response`.
+
+        Reference:
+            Backs :meth:`_age_pct`; also surfaced directly by ``watch_token.main``
+            to print the live age of the token each tick.
+        """
         return time.monotonic() - self._acquired_at
 
     # ------------------------------------------------------------------
@@ -271,9 +356,31 @@ class ZendeskTokenManager:
     # ------------------------------------------------------------------
 
     def _age_pct(self) -> float:
+        """Fraction of the token's TTL that has elapsed, clamped to [0.0, 1.0].
+
+        Reference:
+            Read by :meth:`get_token` (to decide whether to attempt a proactive
+            refresh) and re-checked inside :meth:`_refresh_if_needed` under the
+            lock. ``1.0`` means the token is at or past its expected lifetime.
+        """
         return min(1.0, self.age / self._ttl)
 
     def _refresh_if_needed(self) -> None:
+        """Proactively refresh under the lock, with double-checked locking.
+
+        Acquires the instance lock (bounded by ``TIMEOUT``) and re-tests the age
+        threshold before refreshing, so that when several threads cross the 80%
+        mark together only the first does the network call and the rest observe
+        the already-fresh token. Network/transient failures are swallowed here
+        (the existing token keeps working); only a confirmed revocation inside
+        :meth:`_do_refresh` raises, and that is caught and logged.
+
+        Reference:
+            Called by :meth:`get_token` once ``_age_pct() >= REFRESH_THRESHOLD``.
+            Delegates the HTTP work to :meth:`_do_refresh` and fires
+            :meth:`_notify_all` *after* releasing the lock so callbacks may
+            safely re-enter the manager.
+        """
         callback_payload: Optional[tuple[str, Optional[str]]] = None
         if not self._lock.acquire(timeout=self.TIMEOUT):
             log.warning("Could not acquire refresh lock within timeout; using existing token.")
@@ -289,6 +396,32 @@ class ZendeskTokenManager:
             self._notify_all(*callback_payload)
 
     def _do_refresh(self) -> tuple[str, Optional[str]]:
+        """Perform the OAuth ``refresh_token`` grant against Zendesk.
+
+        Posts to ``https://{subdomain}.zendesk.com/oauth/tokens`` and retries up
+        to ``MAX_RETRIES`` times for transient failures (timeouts, connection
+        errors, HTTP 429/503, and 5xx) using :meth:`_backoff` /
+        :meth:`_parse_retry_after`. On HTTP 200 it hands off to
+        :meth:`_apply_refresh_response` to mutate ``self._token`` /
+        ``self._refresh_token``.
+
+        Important: the caller is responsible for holding ``self._lock`` — this
+        method mutates token state and is never safe to call concurrently.
+
+        Reference:
+            Called by :meth:`force_refresh` and :meth:`_refresh_if_needed`, both
+            of which already hold the lock. Returns the ``(new_token,
+            rotated_refresh_or_None)`` tuple that those callers forward to
+            :meth:`_notify_all`.
+
+        Returns:
+            ``(new_access_token, new_refresh_token_or_None)``. The second item
+            is ``None`` when Zendesk did not rotate the refresh token.
+
+        Raises:
+            TokenRefreshError: Missing credentials, a permanent 4xx (revoked or
+                expired refresh token), or all retries exhausted.
+        """
         if not self._refresh_token:
             raise TokenRefreshError("No refresh token configured.")
         if not self._client_id or not self._client_secret:
@@ -357,6 +490,27 @@ class ZendeskTokenManager:
     def _apply_refresh_response(
         self, resp: requests.Response
     ) -> tuple[str, Optional[str]]:
+        """Parse a successful (HTTP 200) refresh response and store the tokens.
+
+        Validates that the body is JSON containing a string ``access_token``,
+        then updates ``self._token`` and resets ``self._acquired_at`` so the age
+        clock restarts. If the response also carries a new ``refresh_token``
+        (Zendesk rotates it), that is stored too and returned so callers can
+        persist it.
+
+        Reference:
+            Called only by :meth:`_do_refresh` on a 200 response; runs under the
+            lock held by that method's caller.
+
+        Args:
+            resp: The :class:`requests.Response` from the token endpoint.
+
+        Returns:
+            ``(new_access_token, rotated_refresh_token_or_None)``.
+
+        Raises:
+            TokenRefreshError: Body is not JSON or lacks a usable ``access_token``.
+        """
         try:
             data = resp.json()
         except ValueError as exc:
@@ -382,6 +536,22 @@ class ZendeskTokenManager:
         return new_token, rotated_refresh
 
     def _notify_all(self, token: str, refresh_token: Optional[str]) -> None:
+        """Invoke every registered ``on_refresh`` callback with the new tokens.
+
+        Each callback is wrapped in its own try/except so one misbehaving
+        listener cannot prevent the others from running (failures are logged,
+        not raised). Always called *after* the refresh lock has been released,
+        so callbacks may re-enter the manager (e.g. call :meth:`set_token`).
+
+        Reference:
+            Called by :meth:`force_refresh` and :meth:`_refresh_if_needed` with
+            the tuple returned by :meth:`_do_refresh`. Callbacks are registered
+            via :meth:`on_refresh`.
+
+        Args:
+            token: The freshly obtained access token.
+            refresh_token: The rotated refresh token, or ``None`` if unchanged.
+        """
         for cb in self._callbacks:
             try:
                 cb(token, refresh_token)
@@ -390,6 +560,25 @@ class ZendeskTokenManager:
 
     @staticmethod
     def _parse_retry_after(headers, attempt: int) -> float:
+        """Decide how long to wait after a 429/503, honouring ``Retry-After``.
+
+        Uses the server's ``Retry-After`` header when present (clamped to
+        ``[1.0, BACKOFF_CAP]`` seconds); otherwise falls back to exponential
+        backoff (``BACKOFF_BASE ** attempt``). A malformed header value also
+        falls back to exponential backoff.
+
+        Reference:
+            Called by :meth:`_do_refresh` when a refresh is rate-limited or the
+            service is temporarily unavailable. Compare :meth:`_backoff`, which
+            is used for the header-less retry cases.
+
+        Args:
+            headers: The response headers (anything with ``.get``).
+            attempt: Zero-based retry attempt, used as the backoff exponent.
+
+        Returns:
+            Seconds to sleep before the next attempt.
+        """
         raw = headers.get("Retry-After")
         try:
             return max(1.0, min(float(raw), ZendeskTokenManager.BACKOFF_CAP)) if raw else (
@@ -400,6 +589,19 @@ class ZendeskTokenManager:
 
     @staticmethod
     def _backoff(attempt: int) -> None:
+        """Sleep with capped exponential backoff between refresh retries.
+
+        Waits ``min(BACKOFF_BASE ** attempt, BACKOFF_CAP)`` seconds.
+
+        Reference:
+            Called by :meth:`_do_refresh` for transient failures that carry no
+            ``Retry-After`` header (timeouts, connection errors, generic 5xx).
+            Patched out (``client.time.sleep``) in the test-suite so retry paths
+            run instantly — see ``test_client.TestErrorScenarios``.
+
+        Args:
+            attempt: Zero-based retry attempt number, used as the exponent.
+        """
         time.sleep(min(
             ZendeskTokenManager.BACKOFF_BASE ** attempt,
             ZendeskTokenManager.BACKOFF_CAP,
@@ -420,6 +622,17 @@ def load_credentials(path: str = "credentials.json") -> ZendeskTokenManager:
         ``subdomain``, ``oauth_token``, ``oauth_client_id``, ``oauth_client_secret``
 
     ``oauth_refresh_token`` is optional but needed for auto-refresh.
+
+    Reference:
+        Consumes the ``credentials.json`` written by
+        :func:`first_run.save_credentials` (it reads the same keys, including the
+        ``acquired_at`` timestamp). The constructed manager is what
+        ``watch_token.main`` and downstream application code operate on.
+
+    Usage:
+        >>> from client import load_credentials
+        >>> mgr = load_credentials("credentials.json")
+        >>> token = mgr.get_token()
 
     Args:
         path: Path to the JSON credentials file (default ``credentials.json``).

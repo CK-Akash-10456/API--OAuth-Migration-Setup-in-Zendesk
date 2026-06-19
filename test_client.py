@@ -45,11 +45,28 @@ SAMPLE_CREDS = {
 
 
 def make_mgr(**overrides) -> ZendeskTokenManager:
+    """Build a :class:`ZendeskTokenManager` from ``SAMPLE_CREDS`` plus overrides.
+
+    Reference:
+        The standard fixture for fully-credentialed manager tests; pass e.g.
+        ``ttl=1`` to make a token look expired. Used throughout
+        :class:`TestForceRefresh`, :class:`TestCallbacks`,
+        :class:`TestErrorScenarios`, and :class:`TestEdgeCases`.
+    """
     kwargs = {**SAMPLE_CREDS, **overrides}
     return ZendeskTokenManager(**kwargs)
 
 
 def mock_200_response(body: dict = None, status_code: int = 200) -> Mock:
+    """Fake a successful ``requests.post`` result for the token endpoint.
+
+    Reference:
+        Patched in as ``client.requests.post`` return value to exercise the
+        success path of :meth:`ZendeskTokenManager._do_refresh` /
+        :meth:`_apply_refresh_response` without real network I/O. ``body``
+        defaults to a token+refresh pair; override it to simulate rotation,
+        a missing ``access_token``, etc.
+    """
     r = Mock()
     r.status_code = status_code
     r.json.return_value = body or {"access_token": "new_token", "refresh_token": "new_refresh"}
@@ -58,6 +75,14 @@ def mock_200_response(body: dict = None, status_code: int = 200) -> Mock:
 
 
 def mock_err_response(status_code: int, body: str = "") -> Mock:
+    """Fake an error ``requests.post`` result with a status code and text body.
+
+    Reference:
+        Used to drive the retry/degradation and permanent-failure branches of
+        :meth:`ZendeskTokenManager._do_refresh` (e.g. 503 transient, 401/403/400
+        revoked). ``headers`` is empty so :meth:`_parse_retry_after` falls back to
+        exponential backoff.
+    """
     r = Mock()
     r.status_code = status_code
     r.text = body
@@ -71,6 +96,12 @@ def mock_err_response(status_code: int, body: str = "") -> Mock:
 
 
 class TestConstruction:
+    """Covers :meth:`ZendeskTokenManager.__init__` and subdomain normalization.
+
+    Reference: exercises ``__init__`` defaults/TTL and the
+    :func:`client._normalize_subdomain` cases (bare slug, full URL, port, query).
+    """
+
     def test_minimal(self):
         mgr = ZendeskTokenManager("test")
         assert mgr.subdomain == "test"
@@ -124,6 +155,13 @@ class TestConstruction:
 
 
 class TestGetToken:
+    """Covers :meth:`ZendeskTokenManager.get_token`.
+
+    Reference: the proactive-refresh decision (``_age_pct`` vs
+    ``REFRESH_THRESHOLD``), the ``TokenNotSetError`` guard, and graceful
+    degradation when a refresh fails or no client creds are configured.
+    """
+
     def test_raises_when_no_token(self):
         mgr = ZendeskTokenManager("test")
         with pytest_raises(TokenNotSetError, "No OAuth token"):
@@ -172,6 +210,11 @@ class TestGetToken:
 
 
 class TestSetToken:
+    """Covers :meth:`ZendeskTokenManager.set_token` (in-memory update + validation).
+
+    Reference: verifies token/refresh replacement and the non-empty-string guard.
+    """
+
     def test_updates_token(self):
         mgr = ZendeskTokenManager("test")
         mgr.set_token("new_tok")
@@ -194,6 +237,13 @@ class TestSetToken:
 
 
 class TestForceRefresh:
+    """Covers :meth:`ZendeskTokenManager.force_refresh` (the reactive 401 path).
+
+    Reference: success, revocation (raises ``TokenRefreshError``), degradation
+    without a refresh token, the ``TokenNotSetError`` / missing-creds guards, and
+    the exact request payload sent to ``client.requests.post``.
+    """
+
     def test_refreshes_successfully(self):
         mgr = make_mgr()
         with patch("client.requests.post") as mock_post:
@@ -255,6 +305,8 @@ class TestForceRefresh:
 
 
 class TestProperties:
+    """Covers the read-only properties :attr:`has_refresh` and :attr:`age`."""
+
     def test_has_refresh_true(self):
         assert make_mgr().has_refresh is True
 
@@ -269,6 +321,13 @@ class TestProperties:
 
 
 class TestCallbacks:
+    """Covers :meth:`on_refresh` registration and :meth:`_notify_all` dispatch.
+
+    Reference: callbacks fire on refresh with the rotated (or ``None``) refresh
+    token, multiple callbacks run in order, a throwing callback is isolated, and
+    no callback fires when the refresh itself failed.
+    """
+
     def test_callback_fired_on_refresh(self):
         mgr = make_mgr(ttl=1)
         mgr._acquired_at = 0
@@ -336,6 +395,14 @@ class TestCallbacks:
 
 
 class TestLoadCredentials:
+    """Covers :func:`client.load_credentials` (JSON file -> configured manager).
+
+    Reference: valid file with/without refresh token, bad/future ``acquired_at``
+    handling, and the error cases (missing file, missing required field, invalid
+    JSON) that propagate as ``FileNotFoundError`` / ``KeyError`` /
+    ``json.JSONDecodeError``.
+    """
+
     def test_loads_valid_file(self):
         data = {
             "subdomain": "testsub",
@@ -439,6 +506,14 @@ class TestLoadCredentials:
 
 
 class TestThreadSafety:
+    """Covers the double-checked locking in :meth:`get_token` / :meth:`_refresh_if_needed`.
+
+    Reference: concurrent reads are consistent, N threads crossing the threshold
+    together cause exactly one ``requests.post``, and a callback that re-enters
+    the manager (:meth:`set_token`) does not deadlock — because :meth:`_notify_all`
+    runs outside the lock.
+    """
+
     def test_concurrent_get_token(self):
         mgr = ZendeskTokenManager("test", oauth_token="tok")
         results = []
@@ -491,6 +566,14 @@ class TestThreadSafety:
 
 
 class TestErrorScenarios:
+    """Covers the retry/error matrix in :meth:`ZendeskTokenManager._do_refresh`.
+
+    Reference: exhausted retries on 503, timeout and connection-error retries,
+    429 rate-limit-then-success (via :meth:`_parse_retry_after`), permanent
+    400/403, non-JSON body, and a 200 missing ``access_token``. ``client.time.sleep``
+    is patched out so backoff runs instantly.
+    """
+
     def test_max_retries_exhausted(self):
         mgr = make_mgr(ttl=1)
         mgr._acquired_at = 0
@@ -589,6 +672,13 @@ class TestErrorScenarios:
 
 
 class TestEdgeCases:
+    """Covers refresh-token rotation and clock/subdomain bookkeeping.
+
+    Reference: :meth:`_apply_refresh_response` storing (or preserving) the
+    refresh token, ``_acquired_at`` resetting on refresh, and the subdomain
+    staying normalized after construction.
+    """
+
     def test_refresh_token_rotation(self):
         mgr = make_mgr(ttl=1)
         mgr._acquired_at = 0
@@ -628,7 +718,12 @@ class TestEdgeCases:
 
 
 class TestInfo:
-    """Display test — print on success."""
+    """Display test — print on success.
+
+    Reference: a human-readable smoke test of the end-to-end refresh-once-then-
+    cache behavior of :meth:`get_token`; asserts a single ``requests.post`` and
+    prints the resulting manager state.
+    """
 
     def test_info(self):
         mgr = make_mgr(ttl=1)
@@ -653,6 +748,14 @@ class TestInfo:
 
 
 class TestFirstRunHelpers:
+    """Covers the pure helpers in :mod:`first_run` (no real network/browser).
+
+    Reference: :func:`first_run.sanitize_subdomain`, :func:`first_run.build_auth_url`,
+    :func:`first_run.parse_redirect_url` (state validation -> ``SystemExit``), and
+    the request-failure exits of :func:`first_run.exchange_code` /
+    :func:`first_run.verify_token`.
+    """
+
     def test_sanitize_subdomain_accepts_full_hostname(self):
         assert first_run.sanitize_subdomain("https://ACME.zendesk.com/admin") == "acme"
 
@@ -688,7 +791,20 @@ class TestFirstRunHelpers:
 
 
 def pytest_raises(exc_cls, msg=None):
-    """Context-manager for exception assertions (pytest-like API)."""
+    """Context-manager for exception assertions (pytest-like API).
+
+    A dependency-free stand-in for ``pytest.raises`` so this suite runs both
+    under pytest and via the bundled :func:`main`. Asserts the block raises
+    ``exc_cls`` (and, if ``msg`` is given, that it appears in the message).
+
+    Reference:
+        Used by :class:`TestGetToken` and :class:`TestFirstRunHelpers`. Other
+        test classes use plain ``try/except`` for the same purpose.
+
+    Args:
+        exc_cls: The exception type expected to be raised.
+        msg: Optional substring required in the exception message.
+    """
     import contextlib
 
     @contextlib.contextmanager
@@ -713,6 +829,19 @@ def pytest_raises(exc_cls, msg=None):
 # ------------------------------------------------------------------ #
 
 def main():
+    """Run every ``Test*`` class without pytest and print a pass/fail summary.
+
+    Reflectively instantiates each class in the ``classes`` list, runs its
+    ``test_*`` methods in sorted order, prints a tick/cross per test plus a
+    traceback on failure, and returns an exit code (0 = all passed).
+
+    Reference:
+        The ``__main__`` entry point for ``python test_client.py``. The
+        equivalent pytest invocation is ``python -m pytest test_client.py -v``.
+
+    Returns:
+        ``0`` if all tests passed, ``1`` otherwise (suitable for ``sys.exit``).
+    """
     print("=" * 56)
     print("  ZendeskTokenManager — Test Suite")
     print("=" * 56)
