@@ -435,18 +435,16 @@ def main() -> None:
 
     # ---- 1. Gather info -------------------------------------------- #
 
-    raw_sub = input("\n  Zendesk subdomain (e.g. 'mycompany'): ").strip()
-    subdomain = sanitize_subdomain(raw_sub)
+    DEFAULT_SUBDOMAIN = "drum-14136"
+    DEFAULT_CLIENT_ID = "zd_transfer_migration_tool"
+    DEFAULT_CLIENT_SECRET = "169bdb6ba56176ba1e143fd61f0a1d8a4821ccfeb64bd2cab92d944b7e51014b"
 
-    client_id = input("  OAuth client ID: ").strip()
-    if not client_id:
-        print("  ✗ Client ID cannot be empty.")
-        sys.exit(1)
+    raw_sub = input(f"\n  Zendesk subdomain (default: {DEFAULT_SUBDOMAIN}): ").strip()
+    subdomain = sanitize_subdomain(raw_sub or DEFAULT_SUBDOMAIN)
 
-    client_secret = input("  OAuth client secret: ").strip()
-    if not client_secret:
-        print("  ✗ Client secret cannot be empty.")
-        sys.exit(1)
+    client_id = input(f"  OAuth client ID (default: {DEFAULT_CLIENT_ID}): ").strip() or DEFAULT_CLIENT_ID
+
+    client_secret = input(f"  OAuth client secret (default: {DEFAULT_CLIENT_SECRET}): ").strip() or DEFAULT_CLIENT_SECRET
 
     scope = SCOPE
 
