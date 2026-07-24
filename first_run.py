@@ -22,6 +22,7 @@ Dependencies:
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import secrets
@@ -40,10 +41,11 @@ import requests
 
 REDIRECT_URI = "http://localhost/callback"
 
-SCOPES = {
-    "source": "read",
-    "target": "read write hc:write",
-}
+# Default: read-only access (for exporting data)
+SCOPE = "read"
+# SCOPE = "read write hc:write"  # read + write (for importing data)
+# SCOPE = "read write"           # no HC access
+# SCOPE = "read write hc:read hc:write"  # full help center access
 
 TOKEN_ENDPOINT = "https://{subdomain}.zendesk.com/oauth/tokens"
 AUTH_URL = (
@@ -58,6 +60,18 @@ AUTH_URL = (
 CREDS_FILE = Path(__file__).resolve().parent / "credentials.json"
 
 _SUBDOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$")
+
+
+def _jwt_exp(token: str) -> Optional[int]:
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        return payload.get("exp")
+    except (ValueError, json.JSONDecodeError):
+        return None
 
 
 # ------------------------------------------------------------------ #
@@ -283,15 +297,25 @@ def save_credentials(
         oauth_client_secret: OAuth client secret.
         user_info: Identity dict from :func:`verify_token`.
     """
+    now = time.time()
     payload = {
         "subdomain": subdomain,
         "oauth_token": oauth_token,
         "oauth_refresh_token": oauth_refresh_token,
         "oauth_client_id": oauth_client_id,
         "oauth_client_secret": oauth_client_secret,
-        "acquired_at": time.time(),
+        "acquired_at": now,
+        "token_ttl": None,
+        "refresh_token_ttl": None,
         "user": user_info,
     }
+    exp = _jwt_exp(oauth_token)
+    if exp:
+        payload["token_ttl"] = max(300, exp - int(now))
+    if oauth_refresh_token:
+        ref_exp = _jwt_exp(oauth_refresh_token)
+        if ref_exp:
+            payload["refresh_token_ttl"] = max(604800, ref_exp - int(now))
     CREDS_FILE.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -429,15 +453,9 @@ def main() -> None:
         print("  ✗ Client secret cannot be empty.")
         sys.exit(1)
 
-    print("\n  Account role:")
-    print("    [1] Source  (read-only, for exporting data)")
-    print("    [2] Target  (read + write, for importing data)")
-    choice = input("  Choice [1/2] (default: 2): ").strip()
-    role = "target" if choice != "1" else "source"
-    scope = SCOPES[role]
+    scope = SCOPE
 
-    print(f"\n  → Role: {role}")
-    print(f"  → Scope: {scope}")
+    print(f"\n  → Scope: {scope}")
 
     # ---- 2. Generate authorization URL ----------------------------- #
 
@@ -512,12 +530,18 @@ def main() -> None:
     try:
         from client import ZendeskTokenManager
 
+        token_ttl = None
+        exp = _jwt_exp(token)
+        if exp:
+            token_ttl = max(300, exp - int(time.time()))
+
         mgr = ZendeskTokenManager(
             subdomain=subdomain,
             oauth_token=token,
             oauth_refresh_token=refresh_token,
             oauth_client_id=client_id,
             oauth_client_secret=client_secret,
+            ttl=token_ttl,
         )
         fresh = mgr.get_token()
         if fresh == token:
@@ -525,7 +549,7 @@ def main() -> None:
             print(f"    has_refresh: {mgr.has_refresh}")
         else:
             print(f"  ✓ Token manager initialized with new token.")
-        print(f"    age: {mgr.age:.1f}s  |  expiry_pct: {mgr.age / 3600:.1%}")
+        print(f"    age: {mgr.age:.1f}s  |  expiry_pct: {mgr.age / (token_ttl or 3600):.1%}")
     except ImportError:
         print(f"  ℹ  client.py not found in current directory.")
         print(f"    Import and configure ZendeskTokenManager manually.")
@@ -540,9 +564,17 @@ def main() -> None:
     print(f"\n  ✅  OAuth tokens obtained and saved.")
     print(f"  📁  Credentials: {CREDS_FILE}")
     print()
+    exp = _jwt_exp(token)
+    if exp:
+        ttl_secs = max(300, exp - int(time.time()))
+        print(f"  ⏱  Access token TTL: {ttl_secs}s ({ttl_secs // 60}m)")
     if refresh_token:
         print("  🔄  Auto-refresh is ENABLED.")
         print("      Tokens will refresh automatically before expiry.")
+        ref_exp = _jwt_exp(refresh_token)
+        if ref_exp:
+            ref_ttl = max(604800, ref_exp - int(time.time()))
+            print(f"  ⏱  Refresh token TTL: {ref_ttl}s ({ref_ttl // 86400}d)")
     else:
         print("  ⚠  No refresh token received.")
         print("      Auto-refresh is NOT available.")
