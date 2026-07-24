@@ -309,13 +309,8 @@ def save_credentials(
         "refresh_token_ttl": None,
         "user": user_info,
     }
-    exp = _jwt_exp(oauth_token)
-    if exp:
-        payload["token_ttl"] = max(300, exp - int(now))
-    if oauth_refresh_token:
-        ref_exp = _jwt_exp(oauth_refresh_token)
-        if ref_exp:
-            payload["refresh_token_ttl"] = max(604800, ref_exp - int(now))
+    payload["token_ttl"] = 172800       # 48h — Zendesk max access token TTL
+    payload["refresh_token_ttl"] = 7776000   # 90d — Zendesk max refresh token TTL
     CREDS_FILE.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -526,35 +521,31 @@ def main() -> None:
 
     # ---- 7. Test auto-refresh setup --------------------------------- #
 
-    print(f"\n  Testing ZendeskTokenManager with saved credentials...")
+    print(f"\n  Testing OAuth setup with a live API call...")
     try:
-        from client import ZendeskTokenManager
+        from OAuth_Generate import ZendeskOAuth
 
-        token_ttl = None
-        exp = _jwt_exp(token)
-        if exp:
-            token_ttl = max(300, exp - int(time.time()))
-
-        mgr = ZendeskTokenManager(
+        mgr = ZendeskOAuth(
             subdomain=subdomain,
             oauth_token=token,
             oauth_refresh_token=refresh_token,
             oauth_client_id=client_id,
             oauth_client_secret=client_secret,
-            ttl=token_ttl,
         )
         fresh = mgr.get_token()
-        if fresh == token:
-            print(f"  ✓ Token manager initialized. Auto-refresh ready.")
-            print(f"    has_refresh: {mgr.has_refresh}")
-        else:
-            print(f"  ✓ Token manager initialized with new token.")
-        print(f"    age: {mgr.age:.1f}s  |  expiry_pct: {mgr.age / (token_ttl or 3600):.1%}")
+        resp = requests.get(
+            f"https://{subdomain}.zendesk.com/api/v2/users/me.json",
+            headers={"Authorization": f"Bearer {fresh}"},
+            timeout=30,
+        )
+        user = resp.json().get("user", {})
+        print(f"  ✓ Connected as {user.get('name', '?')} ({user.get('role', '?')})")
+        print(f"    has_refresh: {mgr.has_refresh}  |  TTL: {mgr.ttl}s")
+        print(f"    age: {mgr.age:.1f}s  |  auto-refresh at {int(mgr.ttl * 0.8)}s")
     except ImportError:
-        print(f"  ℹ  client.py not found in current directory.")
-        print(f"    Import and configure ZendeskTokenManager manually.")
+        print(f"  ℹ  OAuth_Generate.py not found.")
     except Exception as exc:
-        print(f"  ⚠  Token manager test: {exc}")
+        print(f"  ⚠  Live test: {exc}")
 
     # ---- 8. Summary ------------------------------------------------- #
 
@@ -564,17 +555,11 @@ def main() -> None:
     print(f"\n  ✅  OAuth tokens obtained and saved.")
     print(f"  📁  Credentials: {CREDS_FILE}")
     print()
-    exp = _jwt_exp(token)
-    if exp:
-        ttl_secs = max(300, exp - int(time.time()))
-        print(f"  ⏱  Access token TTL: {ttl_secs}s ({ttl_secs // 60}m)")
+    print(f"  ⏱  Access token TTL:  172800s (48h)  — Zendesk max")
     if refresh_token:
-        print("  🔄  Auto-refresh is ENABLED.")
-        print("      Tokens will refresh automatically before expiry.")
-        ref_exp = _jwt_exp(refresh_token)
-        if ref_exp:
-            ref_ttl = max(604800, ref_exp - int(time.time()))
-            print(f"  ⏱  Refresh token TTL: {ref_ttl}s ({ref_ttl // 86400}d)")
+        print(f"  🔄  Auto-refresh is ENABLED.")
+        print(f"      Tokens will refresh automatically before expiry.")
+        print(f"  ⏱  Refresh token TTL: 7776000s (90d)  — Zendesk max")
     else:
         print("  ⚠  No refresh token received.")
         print("      Auto-refresh is NOT available.")
@@ -584,9 +569,9 @@ def main() -> None:
         )
     print()
     print("  Next steps:")
-    print(f"      from client import ZendeskTokenManager, load_credentials")
-    print(f"      mgr = load_credentials('{CREDS_FILE.name}')")
-    print(f"      token = mgr.get_token()  # always fresh")
+    print(f"      from OAuth_Generate import ZendeskOAuth")
+    print(f"      auth = ZendeskOAuth()")
+    print(f"      requests.get(url, auth=auth)  # always fresh")
     print()
 
 
